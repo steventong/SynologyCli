@@ -1,0 +1,27 @@
+# Build outputs
+/bin/
+*.exe
+*.test
+*.out
+coverage*.txt
+coverage*.html
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.*
+!credentials.example.*
+secrets.*
+config.local.*
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
