@@ -16,6 +16,15 @@ import (
 
 const maxResponseBytes = 2 << 20
 
+var (
+	// ErrOTPRequired indicates that DSM accepted the password authentication
+	// request but requires a one-time password to continue.
+	ErrOTPRequired = errors.New("DSM requires a one-time password")
+
+	// ErrOTPInvalid indicates that DSM rejected the supplied one-time password.
+	ErrOTPInvalid = errors.New("DSM rejected the one-time password")
+)
+
 // Client implements the DSM API discovery and encrypted authentication flow.
 type Client struct {
 	baseURL    *url.URL
@@ -50,10 +59,27 @@ type apiError struct {
 }
 
 func (e apiError) Error() string {
+	switch e.Code {
+	case 403:
+		return "DSM requires a one-time password (API error 403)"
+	case 404:
+		return "DSM rejected the one-time password (API error 404)"
+	}
 	if e.Message == "" {
 		return fmt.Sprintf("DSM API error %d", e.Code)
 	}
 	return fmt.Sprintf("DSM API error %d: %s", e.Code, e.Message)
+}
+
+func (e apiError) Unwrap() error {
+	switch e.Code {
+	case 403:
+		return ErrOTPRequired
+	case 404:
+		return ErrOTPInvalid
+	default:
+		return nil
+	}
 }
 
 type responseEnvelope[T any] struct {

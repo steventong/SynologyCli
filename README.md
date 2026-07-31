@@ -19,16 +19,24 @@ go run ./cmd/synologycli encrypted-login \
 unset SYNOLOGY_PASSWORD
 ```
 
-需要 OTP 时：
+账户启用了两步验证时，首次密码认证返回 OTP 挑战后，CLI 会自动隐藏输入验证码并重试：
 
 ```bash
 read -r -s SYNOLOGY_PASSWORD
-read -r -s SYNOLOGY_OTP
-export SYNOLOGY_PASSWORD SYNOLOGY_OTP
+export SYNOLOGY_PASSWORD
 go run ./cmd/synologycli encrypted-login \
   --server 'https://nas.example.com:5001' \
   --username 'your-account'
-unset SYNOLOGY_PASSWORD SYNOLOGY_OTP
+unset SYNOLOGY_PASSWORD
+```
+
+用于脚本或非交互环境时，可以预先通过 `SYNOLOGY_OTP` 提供验证码：
+
+```bash
+# SYNOLOGY_PASSWORD 与 SYNOLOGY_OTP 由 CI 或 secret manager 注入
+go run ./cmd/synologycli encrypted-login \
+  --server 'https://nas.example.com:5001' \
+  --username 'your-account'
 ```
 
 也可以从标准输入读取密码：
@@ -70,4 +78,5 @@ go test ./...
 - 登录请求不包含明文 `account` / `passwd` 字段；
 - RSA 算法为 PKCS#1 v1.5；
 - 动态 `cipherkey`、`ciphertoken` 和服务器校准时间正确；
+- DSM 403/404 能正确识别为需要 OTP/OTP 无效；
 - 加密失败时不会回退到明文登录。

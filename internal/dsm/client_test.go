@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -199,6 +200,26 @@ func TestEncryptedLoginDoesNotFallBackToPlaintext(t *testing.T) {
 	}
 	if got := loginCalls.Load(); got != 0 {
 		t.Errorf("auth login calls = %d, want 0", got)
+	}
+}
+
+func TestAPIErrorClassifiesOTPFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   int
+		target error
+	}{
+		{name: "required", code: 403, target: ErrOTPRequired},
+		{name: "invalid", code: 404, target: ErrOTPInvalid},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := apiError{Code: test.code}
+			if !errors.Is(err, test.target) {
+				t.Errorf("errors.Is(%v, %v) = false", err, test.target)
+			}
+		})
 	}
 }
 

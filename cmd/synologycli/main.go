@@ -13,12 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"synologycli/internal/dsm"
 )
 
 const (
 	defaultPasswordEnvironment = "SYNOLOGY_PASSWORD"
 	defaultOTPEnvironment      = "SYNOLOGY_OTP"
+	maxOTPPromptAttempts       = 3
 )
 
 func main() {
@@ -54,9 +57,9 @@ func runEncryptedLogin(args []string, stdout, stderr io.Writer) error {
 	username := flags.String("username", "", "DSM 用户名")
 	passwordEnvironment := flags.String("password-env", defaultPasswordEnvironment, "读取密码的环境变量名")
 	passwordStdin := flags.Bool("password-stdin", false, "从标准输入读取密码")
-	otpEnvironment := flags.String("otp-env", defaultOTPEnvironment, "读取 OTP 的环境变量名")
+	otpEnvironment := flags.String("otp-env", defaultOTPEnvironment, "读取预置 OTP 的环境变量名（未提供时交互输入）")
 	session := flags.String("session", "AudioStation", "DSM session 名称")
-	timeout := flags.Duration("timeout", 15*time.Second, "整个登录流程的超时时间")
+	timeout := flags.Duration("timeout", 15*time.Second, "每次 DSM 登录尝试的超时时间")
 	insecureSkipVerify := flags.Bool("insecure-skip-verify", false, "跳过 HTTPS 证书校验（仅用于测试）")
 	showSession := flags.Bool("show-session", false, "输出完整 SID/DID（敏感信息）")
 	flags.Usage = func() {
@@ -107,17 +110,27 @@ func runEncryptedLogin(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, *timeout)
-	defer cancel()
 
-	result, err := client.EncryptedLogin(ctx, dsm.LoginRequest{
-		Username: *username,
-		Password: password,
-		OTPCode:  otp,
-		Session:  *session,
-	})
+	login := func(otpCode string) (dsm.LoginResult, error) {
+		ctx, cancel := context.WithTimeout(signalContext, *timeout)
+		defer cancel()
+		return client.EncryptedLogin(ctx, dsm.LoginRequest{
+			Username: *username,
+			Password: password,
+			OTPCode:  otpCode,
+			Session:  *session,
+		})
+	}
+
+	result, err := loginWithOTPChallenge(login, otp, func() (string, error) {
+		otpCode, promptErr := readOTPFromTerminal(stderr)
+		if promptErr == nil && signalContext.Err() != nil {
+			return "", signalContext.Err()
+		}
+		return otpCode, promptErr
+	}, stderr)
 	if err != nil {
 		return err
 	}
@@ -136,6 +149,35 @@ func runEncryptedLogin(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stdout)
 	return nil
+}
+
+func loginWithOTPChallenge(
+	login func(otpCode string) (dsm.LoginResult, error),
+	initialOTP string,
+	readOTP func() (string, error),
+	output io.Writer,
+) (dsm.LoginResult, error) {
+	result, err := login(initialOTP)
+	for promptAttempt := 0; isOTPChallenge(err) && promptAttempt < maxOTPPromptAttempts; promptAttempt++ {
+		if errors.Is(err, dsm.ErrOTPInvalid) {
+			fmt.Fprintln(output, "验证码无效或已过期，请输入新的验证码。")
+		} else {
+			fmt.Fprintln(output, "DSM 要求进行两步验证。")
+		}
+
+		otp, readErr := readOTP()
+		if readErr != nil {
+			return dsm.LoginResult{}, readErr
+		}
+		result, err = login(otp)
+	}
+	if err != nil {
+		if isOTPChallenge(err) {
+			return dsm.LoginResult{}, fmt.Errorf("两步验证失败，已达到最多 %d 次输入次数: %w", maxOTPPromptAttempts, err)
+		}
+		return dsm.LoginResult{}, err
+	}
+	return result, nil
 }
 
 func readPassword(fromStdin bool, environmentName string) (string, error) {
@@ -159,6 +201,33 @@ func readPassword(fromStdin bool, environmentName string) (string, error) {
 		return "", fmt.Errorf("环境变量 %s 未设置或为空", environmentName)
 	}
 	return password, nil
+}
+
+func readOTPFromTerminal(output io.Writer) (string, error) {
+	fileDescriptor := int(os.Stdin.Fd())
+	if !term.IsTerminal(fileDescriptor) {
+		return "", fmt.Errorf(
+			"DSM 要求两步验证，但当前标准输入不是交互终端；请通过 %s 环境变量提供验证码",
+			defaultOTPEnvironment,
+		)
+	}
+
+	fmt.Fprint(output, "DSM 验证码: ")
+	content, err := term.ReadPassword(fileDescriptor)
+	fmt.Fprintln(output)
+	if err != nil {
+		return "", fmt.Errorf("读取 DSM 验证码: %w", err)
+	}
+
+	otp := strings.TrimSpace(string(content))
+	if otp == "" {
+		return "", errors.New("DSM 验证码不能为空")
+	}
+	return otp, nil
+}
+
+func isOTPChallenge(err error) bool {
+	return errors.Is(err, dsm.ErrOTPRequired) || errors.Is(err, dsm.ErrOTPInvalid)
 }
 
 func maskSecret(secret string) string {
