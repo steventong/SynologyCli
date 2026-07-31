@@ -4,10 +4,78 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"synologycli/internal/dsm"
 )
+
+func TestResolvePasswordPromptsWhenEnvironmentIsMissing(t *testing.T) {
+	promptCalls := 0
+	password, err := resolvePassword(
+		false,
+		"",
+		strings.NewReader(""),
+		func(string) string { return "" },
+		func() (string, error) {
+			promptCalls++
+			return "interactive-password", nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolvePassword() error = %v", err)
+	}
+	if password != "interactive-password" {
+		t.Errorf("password = %q, want interactive-password", password)
+	}
+	if promptCalls != 1 {
+		t.Errorf("prompt calls = %d, want 1", promptCalls)
+	}
+}
+
+func TestResolvePasswordUsesEnvironmentForAutomation(t *testing.T) {
+	promptCalls := 0
+	password, err := resolvePassword(
+		false,
+		"CUSTOM_PASSWORD",
+		strings.NewReader(""),
+		func(name string) string {
+			if name != "CUSTOM_PASSWORD" {
+				t.Errorf("environment name = %q, want CUSTOM_PASSWORD", name)
+			}
+			return "environment-password"
+		},
+		func() (string, error) {
+			promptCalls++
+			return "", errors.New("unexpected prompt")
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolvePassword() error = %v", err)
+	}
+	if password != "environment-password" {
+		t.Errorf("password = %q, want environment-password", password)
+	}
+	if promptCalls != 0 {
+		t.Errorf("prompt calls = %d, want 0", promptCalls)
+	}
+}
+
+func TestResolvePasswordUsesStandardInputWhenRequested(t *testing.T) {
+	password, err := resolvePassword(
+		true,
+		defaultPasswordEnvironment,
+		strings.NewReader("stdin-password\n"),
+		func(string) string { return "environment-password" },
+		func() (string, error) { return "", errors.New("unexpected prompt") },
+	)
+	if err != nil {
+		t.Fatalf("resolvePassword() error = %v", err)
+	}
+	if password != "stdin-password" {
+		t.Errorf("password = %q, want stdin-password", password)
+	}
+}
 
 func TestLoginWithOTPChallengeRetriesAfterRequired(t *testing.T) {
 	var receivedOTPs []string

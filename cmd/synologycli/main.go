@@ -53,12 +53,13 @@ func runEncryptedLogin(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("encrypted-login", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
-	server := flags.String("server", "", "DSM 地址，例如 https://nas.example.com:5001")
+	server := flags.String("server", "", "DSM URL、IP/域名或 QuickConnect ID")
 	username := flags.String("username", "", "DSM 用户名")
-	passwordEnvironment := flags.String("password-env", defaultPasswordEnvironment, "读取密码的环境变量名")
-	passwordStdin := flags.Bool("password-stdin", false, "从标准输入读取密码")
+	passwordEnvironment := flags.String("password-env", "", "从指定环境变量读取密码（默认交互输入）")
+	passwordInput := flags.Bool("password", false, "从标准输入读取密码（默认在终端中隐藏输入）")
 	otpEnvironment := flags.String("otp-env", defaultOTPEnvironment, "读取预置 OTP 的环境变量名（未提供时交互输入）")
 	session := flags.String("session", "AudioStation", "DSM session 名称")
+	useHTTP := flags.Bool("http", false, "对无协议地址或 QuickConnect ID 使用 HTTP（默认 HTTPS）")
 	timeout := flags.Duration("timeout", 15*time.Second, "每次 DSM 登录尝试的超时时间")
 	insecureSkipVerify := flags.Bool("insecure-skip-verify", false, "跳过 HTTPS 证书校验（仅用于测试）")
 	showSession := flags.Bool("show-session", false, "输出完整 SID/DID（敏感信息）")
@@ -86,7 +87,7 @@ func runEncryptedLogin(args []string, stdout, stderr io.Writer) error {
 		return errors.New("--timeout 必须大于 0")
 	}
 
-	password, err := readPassword(*passwordStdin, *passwordEnvironment)
+	password, err := readPassword(*passwordInput, *passwordEnvironment, stderr)
 	if err != nil {
 		return err
 	}
@@ -100,18 +101,28 @@ func runEncryptedLogin(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "警告：已跳过 HTTPS 证书校验，仅应在受控测试环境使用。")
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- explicit test-only CLI flag
 	}
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(*server)), "http://") {
-		fmt.Fprintln(stderr, "警告：当前使用 HTTP。RSA 可隐藏凭据，但无法阻止中间人替换公钥；建议使用 HTTPS。")
-	}
 	httpClient := &http.Client{Transport: transport}
-
-	client, err := dsm.NewClient(*server, httpClient)
-	if err != nil {
-		return err
-	}
 
 	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	resolveContext, cancelResolve := context.WithTimeout(signalContext, *timeout)
+	resolvedServer, err := dsm.ResolveServer(resolveContext, *server, !*useHTTP, httpClient)
+	cancelResolve()
+	if err != nil {
+		return err
+	}
+	if resolvedServer.QuickConnect {
+		fmt.Fprintln(stderr, "QuickConnect ID 已解析到可用 DSM 地址。")
+	}
+	if strings.HasPrefix(strings.ToLower(resolvedServer.URL), "http://") {
+		fmt.Fprintln(stderr, "警告：当前使用 HTTP。RSA 可隐藏凭据，但无法阻止中间人替换公钥；建议使用 HTTPS。")
+	}
+
+	client, err := dsm.NewClient(resolvedServer.URL, httpClient)
+	if err != nil {
+		return err
+	}
 
 	login := func(otpCode string) (dsm.LoginResult, error) {
 		ctx, cancel := context.WithTimeout(signalContext, *timeout)
@@ -180,9 +191,33 @@ func loginWithOTPChallenge(
 	return result, nil
 }
 
-func readPassword(fromStdin bool, environmentName string) (string, error) {
+func readPassword(fromStdin bool, environmentName string, output io.Writer) (string, error) {
+	return resolvePassword(
+		fromStdin,
+		environmentName,
+		os.Stdin,
+		os.Getenv,
+		func() (string, error) {
+			return readSecretFromTerminal(
+				output,
+				"DSM 密码: ",
+				"DSM 密码",
+				"使用 --password-env "+defaultPasswordEnvironment+" 或 --password",
+				false,
+			)
+		},
+	)
+}
+
+func resolvePassword(
+	fromStdin bool,
+	environmentName string,
+	input io.Reader,
+	getenv func(string) string,
+	prompt func() (string, error),
+) (string, error) {
 	if fromStdin {
-		content, err := io.ReadAll(io.LimitReader(os.Stdin, 64<<10))
+		content, err := io.ReadAll(io.LimitReader(input, 64<<10))
 		if err != nil {
 			return "", fmt.Errorf("从标准输入读取密码：%w", err)
 		}
@@ -193,37 +228,49 @@ func readPassword(fromStdin bool, environmentName string) (string, error) {
 		return password, nil
 	}
 
-	if environmentName == "" {
-		return "", errors.New("必须使用 --password-stdin 或指定 --password-env")
+	if environmentName != "" {
+		if password := getenv(environmentName); password != "" {
+			return password, nil
+		}
 	}
-	password := os.Getenv(environmentName)
-	if password == "" {
-		return "", fmt.Errorf("环境变量 %s 未设置或为空", environmentName)
-	}
-	return password, nil
+	return prompt()
 }
 
 func readOTPFromTerminal(output io.Writer) (string, error) {
+	return readSecretFromTerminal(
+		output,
+		"DSM 验证码: ",
+		"DSM 验证码",
+		"通过 "+defaultOTPEnvironment+" 环境变量提供",
+		true,
+	)
+}
+
+func readSecretFromTerminal(output io.Writer, prompt, secretName, noninteractiveHint string, trimSpace bool) (string, error) {
 	fileDescriptor := int(os.Stdin.Fd())
 	if !term.IsTerminal(fileDescriptor) {
 		return "", fmt.Errorf(
-			"DSM 要求两步验证，但当前标准输入不是交互终端；请通过 %s 环境变量提供验证码",
-			defaultOTPEnvironment,
+			"%s未提供且当前标准输入不是交互终端；请%s",
+			secretName,
+			noninteractiveHint,
 		)
 	}
 
-	fmt.Fprint(output, "DSM 验证码: ")
+	fmt.Fprint(output, prompt)
 	content, err := term.ReadPassword(fileDescriptor)
 	fmt.Fprintln(output)
 	if err != nil {
-		return "", fmt.Errorf("读取 DSM 验证码: %w", err)
+		return "", fmt.Errorf("读取%s: %w", secretName, err)
 	}
 
-	otp := strings.TrimSpace(string(content))
-	if otp == "" {
-		return "", errors.New("DSM 验证码不能为空")
+	secret := string(content)
+	if trimSpace {
+		secret = strings.TrimSpace(secret)
 	}
-	return otp, nil
+	if secret == "" {
+		return "", fmt.Errorf("%s不能为空", secretName)
+	}
+	return secret, nil
 }
 
 func isOTPChallenge(err error) bool {
